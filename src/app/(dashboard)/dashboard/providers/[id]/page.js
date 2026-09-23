@@ -155,7 +155,11 @@ export default function ProviderDetailPage() {
   const supportsApiKeyAuth = !!APIKEY_PROVIDERS[providerId] || authModes.includes("apikey");
   const isFreeNoAuth = !!FREE_PROVIDERS[providerId]?.noAuth;
   const staticModels = getModelsByProviderId(providerId);
-  const models = (providerId === "cursor" || providerId === "zed") && liveModels.length > 0
+  // Live catalogs (cursor/zed have no usable static list); subscription
+  // gateways (opencode-go/commandcode) drift, so the refresh button in the
+  // header re-fetches through the connection endpoint for these too.
+  const CANLI_KESIF = ["cursor", "zed", "opencode-go", "commandcode"];
+  const models = CANLI_KESIF.includes(providerId) && liveModels.length > 0
     ? liveModels
     : staticModels;
   const providerAlias = getProviderAlias(providerId);
@@ -474,7 +478,7 @@ export default function ProviderDetailPage() {
   // the provider id or connection list changes — no polling, no loop.
   // Cursor path is statement-identical to before; zed adds error surfacing.
   useEffect(() => {
-    const isLiveCatalog = providerId === "cursor" || providerId === "zed";
+    const isLiveCatalog = CANLI_KESIF.includes(providerId);
     if (!isLiveCatalog) {
       setLiveModels([]);
       return;
@@ -512,6 +516,27 @@ export default function ProviderDetailPage() {
 
     return () => { cancelled = true; };
   }, [providerId, connections]);
+
+  // Subscription gateways drift: header refresh button re-fires the same
+  // live fetch on demand. Separated from the auto effect above (which runs
+  // only on provider/connection change) so the button has a stable target.
+  const [canliYukleniyor, setCanliYukleniyor] = useState(false);
+  const canliYenile = useCallback(async () => {
+    const connection = connections.find((item) => item.isActive !== false);
+    if (!connection?.id) return;
+    setCanliYukleniyor(true);
+    try {
+      const res = await fetch(`/api/providers/${connection.id}/models`, { cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (res.ok && Array.isArray(data?.models) && data.models.length > 0) {
+        setLiveModels(data.models);
+      }
+    } catch {
+      /* sessiz: statik liste durur */
+    } finally {
+      setCanliYukleniyor(false);
+    }
+  }, [connections]);
 
   // Fetch suggested models from provider's public API (if configured)
   useEffect(() => {
@@ -1183,8 +1208,9 @@ export default function ProviderDetailPage() {
 
     return (
       <div className="flex flex-wrap gap-3">
-        {/* Custom models first */}
-        {customModelRows.map((model) => (
+        {/* Custom models first (hidden while disabled — they live in the
+            restorable Disabled section below) */}
+        {customModelRows.filter((model) => !disabledSet.has(model.id)).map((model) => (
           <ModelRow
             key={`${model.source}-${model.fullModel}`}
             model={{ id: model.id, name: model.name }}
@@ -1275,6 +1301,36 @@ export default function ProviderDetailPage() {
         )}
 
         {/* Suggested models from provider API — show only models not yet added */}
+        {/* Live-connection catalogs (opencode-go/commandcode): account models
+            not yet registered get a one-click add row. */}
+        {(providerId === "opencode-go" || providerId === "commandcode") && (() => {
+          const kayitli = new Set([
+            ...models.map((m) => m.id),
+            ...customModelRows.map((m) => m.id),
+          ]);
+          const yeni = liveModels.filter((m) => m?.id && !kayitli.has(m.id));
+          if (!yeni.length) return null;
+          return (
+            <div className="mb-3 w-full rounded-lg border border-dashed border-text-muted/40 px-3 py-2">
+              <div className="mb-2 text-xs text-text-muted">
+                {translate("New models on your account:")} <b>{yeni.length}</b>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {yeni.slice(0, 30).map((m) => (
+                  <span key={m.id} className="flex items-center gap-2 rounded-lg border px-2 py-1 font-mono text-xs">
+                    {m.id}
+                    <button
+                      className="rounded px-1.5 py-0.5 text-[11px] text-primary hover:bg-sidebar"
+                      onClick={() => handleAddCustomModel(m.id, "llm", providerStorageAlias)}
+                    >
+                      {translate("Add")}
+                    </button>
+                  </span>
+                ))}
+              </div>
+            </div>
+          );
+        })()}
         {suggestedModels.length > 0 && (() => {
           const addedFullModels = new Set([
             ...Object.values(modelAliases),
@@ -1307,12 +1363,18 @@ export default function ProviderDetailPage() {
           );
         })()}
 
-        {/* Disabled models — restorable */}
-        {disabledDisplayModels.length > 0 && (
+        {/* Disabled models — restorable (built-in + custom).
+            Disabled custom models must appear here too: otherwise they stay
+            visible above with no way back. */}
+        {(() => {
+          const ozelKapali = customModelRows.filter((m) => disabledSet.has(m.id));
+          const hepsi = [...disabledDisplayModels, ...ozelKapali.filter((m) => !disabledDisplayModels.some((d) => d.id === m.id))];
+          if (!hepsi.length) return null;
+          return (
           <div className="w-full mt-2">
-            <p className="text-xs text-text-muted mb-2">Disabled models ({disabledDisplayModels.length}):</p>
+            <p className="text-xs text-text-muted mb-2">Disabled models ({hepsi.length}):</p>
             <div className="flex flex-wrap gap-2">
-              {disabledDisplayModels.map((m) => (
+              {hepsi.map((m) => (
                 <button
                   key={m.id}
                   onClick={() => handleEnableModel(m.id)}
@@ -1325,7 +1387,8 @@ export default function ProviderDetailPage() {
               ))}
             </div>
           </div>
-        )}
+          );
+        })()}
       </div>
     );
   };
@@ -1769,6 +1832,11 @@ export default function ProviderDetailPage() {
             const activeIds = allIds.filter((id) => !disabledModelIds.includes(id));
             return (
               <div className="flex gap-2">
+                {(providerId === "opencode-go" || providerId === "commandcode") && (
+                  <Button size="sm" variant="secondary" icon="refresh" onClick={canliYenile} disabled={canliYukleniyor}>
+                    {canliYukleniyor ? translate("Fetching…") : translate("Fetch Models")}
+                  </Button>
+                )}
                 {disabledModelIds.length > 0 && (
                   <Button size="sm" variant="secondary" icon="restart_alt" onClick={handleEnableAll}>
                     Active All
